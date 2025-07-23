@@ -1,10 +1,10 @@
-.PHONY: build docker test lint
+.PHONY: build test lint
 
 build:
 	go build -o bin/mongobetween .
 
-docker:
-	docker-compose up
+# docker:
+# 	docker-compose up
 
 test:
 	go test -count 1 -race ./...
