@@ -5,7 +5,6 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - add/ci/helm-chart-workflow
       - master
     tags:
       - "v*"
@@ -49,6 +48,7 @@ jobs:
             type=semver,pattern=v{{major}}.{{minor}}
             type=semver,pattern=v{{version}}
 
+      # remove this when readpreference is supported upstream
       - name: Docker - build and push mongobetween
         uses: docker/build-push-action@v6
         with:
