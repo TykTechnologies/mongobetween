@@ -18,6 +18,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/readpref"
 	"go.mongodb.org/mongo-driver/x/mongo/driver"
 	"go.mongodb.org/mongo-driver/x/mongo/driver/topology"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/wiremessage"
 	"go.uber.org/zap"
 )
 
@@ -25,9 +26,10 @@ const pingTimeout = 60 * time.Second
 const disconnectTimeout = 10 * time.Second
 
 type Mongo struct {
-	log    *zap.Logger
-	statsd *statsd.Client
-	opts   *options.ClientOptions
+	log             *zap.Logger
+	statsd          *statsd.Client
+	opts            *options.ClientOptions
+	defaultReadPref *readpref.ReadPref
 
 	mu           sync.RWMutex
 	client       *mongo.Client
@@ -71,10 +73,16 @@ func Connect(log *zap.Logger, sd *statsd.Client, opts *options.ClientOptions, pi
 	go topologyMonitor(log, t)
 
 	rtCtx, rtCancel := context.WithCancel(context.Background())
+	defaultReadPref := opts.ReadPreference
+	if defaultReadPref == nil {
+		defaultReadPref = readpref.Secondary()
+	}
+
 	m := Mongo{
 		log:             log,
 		statsd:          sd,
 		opts:            opts,
+		defaultReadPref: defaultReadPref,
 		client:          c,
 		topology:        t,
 		cursors:         newCursorCache(),
@@ -154,7 +162,8 @@ func (m *Mongo) RoundTrip(msg *Message, tags []string) (_ *Message, err error) {
 	requestCursorID, _ := msg.Op.CursorID()
 	requestCommand, collection := msg.Op.CommandAndCollection()
 	transactionDetails := msg.Op.TransactionDetails()
-	readPref, _ := msg.Op.ReadPref()
+	readPref, readPrefProvided := msg.Op.ReadPref()
+	readPref = m.resolveReadPref(readPref, readPrefProvided, requestCommand, msg.Op)
 	server, err := m.selectServer(requestCursorID, collection, transactionDetails, readPref)
 	if err != nil {
 		return nil, err
@@ -231,6 +240,44 @@ func (m *Mongo) RoundTrip(msg *Message, tags []string) (_ *Message, err error) {
 	}, nil
 }
 
+func (m *Mongo) resolveReadPref(rpref *readpref.ReadPref, provided bool, command Command, op Operation) *readpref.ReadPref {
+	if provided && rpref != nil {
+		return rpref
+	}
+
+	if !shouldApplyConfiguredReadPref(command, op) {
+		return readpref.Primary()
+	}
+
+	if m.defaultReadPref != nil {
+		return m.defaultReadPref
+	}
+
+	return readpref.Secondary()
+}
+
+func shouldApplyConfiguredReadPref(command Command, op Operation) bool {
+	if IsWrite(command) {
+		return false
+	}
+
+	switch command {
+	case AbortTransaction, CommitTransaction, EndSessions, IsMaster, Ismaster:
+		return false
+	}
+
+	switch op.OpCode() {
+	case wiremessage.OpInsert, wiremessage.OpUpdate, wiremessage.OpDelete:
+		return false
+	}
+
+	if command == Unknown && op.OpCode() != wiremessage.OpQuery {
+		return false
+	}
+
+	return true
+}
+
 func (m *Mongo) selectServer(requestCursorID int64, collection string, transDetails *TransactionDetails, readPref *readpref.ReadPref) (server driver.Server, err error) {
 	defer func(start time.Time) {
 		_ = m.statsd.Timing("server_selection", time.Since(start), []string{fmt.Sprintf("success:%v", err == nil)}, 1)
@@ -255,7 +302,7 @@ func (m *Mongo) selectServer(requestCursorID int64, collection string, transDeta
 
 	// Select a server
 	selector := description.CompositeSelector([]description.ServerSelector{
-		description.ReadPrefSelector(readPref),   // ignored by sharded clusters
+		description.ReadPrefSelector(readPref),             // ignored by sharded clusters
 		description.LatencySelector(15 * time.Millisecond), // default localThreshold for the client
 	})
 	return m.topology.SelectServer(m.roundTripCtx, selector)
